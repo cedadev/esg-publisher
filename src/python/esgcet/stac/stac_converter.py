@@ -205,14 +205,16 @@ class ESGSTACConverter:
         east_degrees = dataset_doc.get("east_degrees", 180.0)
         north_degrees = dataset_doc.get("north_degrees", 90.0)
 
-        if namespace.startswith("cmip"):
-            west_degrees -= 180
-            east_degrees -= 180
-        # STAC needs longitude in range [-180, 180], but CF might use [0, 360]
-        if west_degrees > 180:
-            west_degrees -= 360
-        if east_degrees > 180:
-            east_degrees -= 360
+        # STAC needs longitude in range [-180, 180], but CF might use [0, 360)
+
+        if abs(east_degrees - west_degrees - 360) < 1e-3:
+            # represent any global range (e.g. 0 to 360 or -180 to 180 in the data)
+            # as -180 to 180
+            west_degrees, east_degrees = -180., 180.
+        else:
+            # otherwise force each value separately to range [-180, 180)
+            west_degrees = (west_degrees + 180) % 360 - 180
+            east_degrees = (east_degrees + 180) % 360 - 180
 
         dt_start = dataset_doc.get("datetime_start", None)
         dt_end = dataset_doc.get("datetime_end", None)

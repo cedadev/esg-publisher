@@ -45,81 +45,98 @@ class ESGPubXArrayHandler(ESGPubHandlerBase):
         return [x for x in variable]
 
     def _get_time_str(self, timeval):
-        if type(timeval.item()) is float or type(timeval.item()) is int:
+        if hasattr(timeval, "item"):
+            timeval = timeval.item()
+        if type(timeval) is float or type(timeval) is int:
             x = str(timeval)
             idx = x.index('.')
             return x[:idx] + 'Z'
         else:
-            return timeval.item().isoformat(timespec="seconds") + "Z"
+            return timeval.isoformat(timespec="seconds") + "Z"
+
+
+    def _get_item(self, obj):
+        if hasattr(obj, "compute"):
+            obj = obj.compute()
+        return obj.item()
+
+
+    def _get_min_max_bounds(self, scanobj, var):
+
+        if var.name not in scanobj.coords:
+            raise ValueError("_get_min_max_bounds called on "
+                             f"non-coordinate variable {var.name}")
         
-    def _get_min_max_bounds(self, latlon):
-        bigarr = latlon[0] + latlon[-1]
-        return float(np.min(bigarr)), float(np.max(bigarr))
-    
+        stdname = var.attrs.get("standard_name")
+
+        # use the bounds variable instead if available, so that the range
+        # that is returned will include the bounds and not just the central value
+        bounds_var = var.attrs.get("bounds")
+        if bounds_var is not None:
+            var = scanobj[bounds_var]
+            using_bounds_var = True
+        else:
+            using_bounds_var = False
+
+        # undo any broadcasting in time that xarray may have done
+        # for non-time variable (seems to do this for vertices array
+        # of original shape (ny, nx, 4) when opening multiple files)
+        if stdname != "time":
+            dims = var.dims
+            if dims and dims[0] == "time":
+                var = var[0]
+
+        shape = var.shape
+        if not using_bounds_var and len(shape) == 1:
+            # 1d coordinate variable
+            minmax = self._get_item(var[0]), self._get_item(var[-1])
+        elif using_bounds_var and len(shape) == 2 and shape[1] == 2:
+            # bounds variable of expected shape for 1d coordinate variable
+            minmax = self._get_item(var[0][0]), self._get_item(var[-1][1])
+        else:
+            # complex grid (>1d coordinate variable)
+            minmax = (var.values.min(), var.values.max())
+
+        # ensure that max >= min in most cases (even if e.g. data has lats
+        # from north to south), but NOT for longitude because it is valid to
+        # have min > max numerically due to wrapping, so don't disrupt this
+        # because swapping the ordering changes the meaning in non-global case
+
+        if stdname != "longitude" and minmax[1] < minmax[0]:
+            minmax = (minmax[1], minmax[0])
+
+        return minmax
+
+
+    def _get_coord_var_by_stdname(self, scanobj, stdname):
+        for coord in scanobj.coords:
+            var = scanobj[coord]
+            if var.attrs.get("standard_name") == stdname:
+                return var
+        return None
+
+
     def set_bounds(self, record, scanobj):
 
         geo_units = []
-        # latitude
-        if "lat" in scanobj.coords:
-            lat = scanobj.coords["lat"]
-            if len(lat) > 0:
-                record["north_degrees"] = float(lat.values.max())
-                record["south_degrees"] = float(lat.values.min())
-            else:
-                self.publog.warn("'lat' found but len 0")          
-        elif "latitude" in scanobj.coords:
-            lat = scanobj.coords["latitude"]
-            if len(lat) > 0:
-                if isinstance(lat[0].values, (list, np.ndarray)):
-                    minval, maxval = self._get_min_max_bounds(lat)
-                    record["north_degrees"] = minval
-                    record["south_degrees"] = maxval
 
-                else:    
-                    record["north_degrees"] = lat[-1].values.item()
-                    record["south_degrees"] = lat[0].values.item()
-                geo_units.append(lat.units)
+        for (stdname, bounds_names, conv) in [
+                ("latitude", ("south_degrees", "north_degrees"), None),
+                ("longitude", ("west_degrees", "east_degrees"), None),
+                ("time", ("datetime_start", "datetime_end"), self._get_time_str),
+                ("air_pressure", ("height_top", "height_bottom"), None),
+        ]:
+            var = self._get_coord_var_by_stdname(scanobj, stdname)
+            if var is not None:
+                if len(var) > 0:
+                    minmax = self._get_min_max_bounds(scanobj, var)
+                    if conv is not None:
+                        minmax = (conv(minmax[0]), conv(minmax[1]))
+                    record[bounds_names[0]], record[bounds_names[1]] = minmax
+                if "units" in var.attrs:
+                    geo_units.append(var.units)
             else:
-                self.publog.warn("Latitude found but len 0")
-        else:
-            self.publog.warn("Lat/Latitude not found")
-        # longitude
-        if "lon" in scanobj.coords:
-            lon = scanobj.coords["lon"]
-            if len(lon) > 0:
-                record["east_degrees"] = float(lon.values.max())
-                record["west_degrees"] = float(lon.values.min())
-            else:
-                self.publog.warn("'lon' found but len 0")          
-        elif "longitude" in scanobj.coords:
-            lon = scanobj.coords["longitude"]
-            if len(lon) > 0:
-                if isinstance(lon[0].values, (list, np.ndarray)):
-                    minval, maxval = self._get_min_max_bounds(lon)   
-                    record["east_degrees"] = float(minval)
-                    record["west_degrees"] = float(maxval)
-                else:
-                    record["east_degrees"] = float(lon[-1].values.item())
-                    record["west_degrees"] = float(lon[0].values.item())
-                geo_units.append(lon.units)
-            else:
-                self.publog.warn("Latitude found but len 0")
-                # time
-        else:
-            self.publog.warn("Lon/Longitude not found")
-        if "time" in scanobj.coords:
-            ti = scanobj.coords["time"]
-            record["datetime_start"] = self._get_time_str(ti[0].values)
-            record["datetime_end"] = self._get_time_str(ti[-1].values)
-        # plev
-        if "plev" in scanobj.coords:
-            try:
-                plev = scanobj.coords["plev"]
-                record["height_top"] = plev[0].values.item() 
-                record["height_bottom"] = plev[-1].values.item() 
-                geo_units.append(plev.units)
-            except:
-                self.publog.warn("plev found but not an expected type")
+                self.publog.warn(f"{stdname} found but len 0")
+
         if len(geo_units) > 0:
             record["geo_units"] = geo_units
-            
