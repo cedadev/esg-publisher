@@ -216,6 +216,16 @@ class ESGSTACConverter:
             west_degrees = (west_degrees + 180) % 360 - 180
             east_degrees = (east_degrees + 180) % 360 - 180
 
+        if south_degrees < -90.:
+            func = self.publog.info if south_degrees > -90.001 else self.publog.warning
+            func(f"forcing min lat {south_degrees} into range (-90)")
+            south_degrees = -90.
+
+        if north_degrees > 90.:
+            func = self.publog.info if north_degrees < 90.001 else self.publog.warning
+            func(f"forcing max lat {north_degrees} into range (90)")
+            north_degrees = 90.
+
         dt_start = dataset_doc.get("datetime_start", None)
         dt_end = dataset_doc.get("datetime_end", None)
         properties = {"size": size, "created": now, "updated": now, "retracted": False}

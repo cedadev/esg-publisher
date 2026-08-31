@@ -61,6 +61,14 @@ class ESGPubXArrayHandler(ESGPubHandlerBase):
         return obj.item()
 
 
+    def _undo_time_broadcast(self, var):
+        dims = var.dims
+        if dims and dims[0] == "time":
+            return var[0]
+        else:
+            return var
+
+
     def _get_min_max_bounds(self, scanobj, var):
 
         if var.name not in scanobj.coords:
@@ -71,31 +79,60 @@ class ESGPubXArrayHandler(ESGPubHandlerBase):
 
         # use the bounds variable instead if available, so that the range
         # that is returned will include the bounds and not just the central value
-        bounds_var = var.attrs.get("bounds")
-        if bounds_var is not None:
-            var = scanobj[bounds_var]
+        bounds_var_name = var.attrs.get("bounds")
+        if bounds_var_name is not None:
+            bounds_var = scanobj[bounds_var_name]
             using_bounds_var = True
+            self.publog.info(f"{stdname} has bounds var")
         else:
             using_bounds_var = False
+            self.publog.info(f"{stdname} no bounds var")
 
         # undo any broadcasting in time that xarray may have done
         # for non-time variable (seems to do this for vertices array
         # of original shape (ny, nx, 4) when opening multiple files)
         if stdname != "time":
-            dims = var.dims
-            if dims and dims[0] == "time":
-                var = var[0]
+            var = self._undo_time_broadcast(var)
+            if using_bounds_var:
+                bounds_var = self._undo_time_broadcast(bounds_var)
 
         shape = var.shape
         if not using_bounds_var and len(shape) == 1:
+
             # 1d coordinate variable
-            minmax = self._get_item(var[0]), self._get_item(var[-1])
+            first = self._get_item(var[0])
+            last = self._get_item(var[-1])
+            minmax = (first, last)
+
+            # deal with a special case
+            # no bounds variable specified, but values on a regular
+            # longitude grid make it obvious that this is really global
+            if (stdname == "longitude"
+                and var.size > 1):
+
+                interval = self._get_item(var[1]) - first
+                after_last = last + interval
+                if abs(after_last - first - 360) < 1e-3:
+                    minmax = (first, after_last)
+
         elif using_bounds_var and len(shape) == 2 and shape[1] == 2:
             # bounds variable of expected shape for 1d coordinate variable
-            minmax = self._get_item(var[0][0]), self._get_item(var[-1][1])
+            minmax = (self._get_item(bounds_var[0][0]),
+                      self._get_item(bounds_var[-1][1]))
+
         else:
             # complex grid (>1d coordinate variable)
-            minmax = (var.values.min(), var.values.max())
+            # use the extreme values found
+
+            # Where a bounds var is used, look in both the var and the bounds var.
+            # Normally the extreme values would be found in the bounds var, but in one
+            # example (CNRM-CM6-1-HR), for longitude, a gridbox *centre* was on the
+            # 180 meridian, hence why looking also in the main var.
+            if using_bounds_var:
+                minmax = (min(var.values.min(), bounds_var.values.min()),
+                          max(var.values.max(), bounds_var.values.max()))
+            else:
+                minmax = (var.values.min(), var.values.max())
 
         # ensure that max >= min in most cases (even if e.g. data has lats
         # from north to south), but NOT for longitude because it is valid to
