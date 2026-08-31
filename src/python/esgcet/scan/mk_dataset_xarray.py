@@ -128,15 +128,16 @@ class ESGPubXArrayHandler(ESGPubHandlerBase):
         ]:
             var = self._get_coord_var_by_stdname(scanobj, stdname)
             if var is not None:
-                if len(var) > 0:
+                if len(var.shape) > 0 and var.size > 0:
                     minmax = self._get_min_max_bounds(scanobj, var)
                     if conv is not None:
                         minmax = (conv(minmax[0]), conv(minmax[1]))
                     record[bounds_names[0]], record[bounds_names[1]] = minmax
-                if "units" in var.attrs:
-                    geo_units.append(var.units)
-            else:
-                self.publog.warn(f"{stdname} found but len 0")
+                    if "units" in var.attrs:
+                        geo_units.append(var.units)
+                else:
+                    self.publog.warn(f"{stdname} found but len 0")
+
 
         if len(geo_units) > 0:
             record["geo_units"] = geo_units
