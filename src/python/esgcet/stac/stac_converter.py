@@ -200,10 +200,10 @@ class ESGSTACConverter:
         if not assets:
             return None
 
-        west_degrees = dataset_doc.get("west_degrees", -180.0)
-        south_degrees = dataset_doc.get("south_degrees", -90.0)
-        east_degrees = dataset_doc.get("east_degrees", 180.0)
-        north_degrees = dataset_doc.get("north_degrees", 90.0)
+        west_degrees = float(dataset_doc.get("west_degrees", -180.0))
+        south_degrees = float(dataset_doc.get("south_degrees", -90.0))
+        east_degrees = float(dataset_doc.get("east_degrees", 180.0))
+        north_degrees = float(dataset_doc.get("north_degrees", 90.0))
 
         # STAC needs longitude in range [-180, 180], but CF might use [0, 360)
 
@@ -212,9 +212,13 @@ class ESGSTACConverter:
             # as -180 to 180
             west_degrees, east_degrees = -180., 180.
         else:
-            # otherwise force each value separately to range [-180, 180)
+            # otherwise force each value separately to range [-180, 180) (for west)
+            # or (-180, 180] (for east)
             west_degrees = (west_degrees + 180) % 360 - 180
             east_degrees = (east_degrees + 180) % 360 - 180
+
+            if east_degrees == -180.:
+                east_degrees = 180.
 
         if south_degrees < -90.:
             func = self.publog.info if south_degrees > -90.001 else self.publog.warning

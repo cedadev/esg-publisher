@@ -2,19 +2,34 @@ import xarray, netCDF4
 from esgcet.scan.handler_base import ESGPubHandlerBase
 import os.path
 import numpy as np
+import re
 
 class ESGPubXArrayHandler(ESGPubHandlerBase):
 
     @staticmethod
     def xarray_load(map_data):
-        datafile = map_data[0][1]
-        destpath = os.path.dirname(datafile)
+        filenames = [row[1] for row in map_data]
+        if len(filenames) > 1:
 
-        filespec = f"{destpath}/*.nc"
+            # optimise: only need first and last file (in sorted order) to correctly evaluate
+            # data time range, if filenames all follow a common pattern but with a numeric
+            # date string - see if they all have the same normalised filename (after
+            # replacing actual digits with <DIGIT>)
+            #
+            # This saves time and memory for long timeseries.
+            #
+            # The assets dictionary is populated directly from the mapfile data, and is 
+            # not affected by this.
+
+            if len({re.sub(r"\d", "<DIGIT>", filename)
+                    for filename in filenames}) == 1:
+                # use min() and max() rather than [0] and [-1] because esgmapfile might not
+                # have created the lines in sorted order
+                filenames = [min(filenames), max(filenames)]
 
         time_coder = xarray.coders.CFDatetimeCoder(use_cftime=True)
         res = xarray.open_mfdataset(
-            filespec,
+            filenames,
             decode_times=time_coder,
             data_vars='all'
         )
@@ -69,6 +84,66 @@ class ESGPubXArrayHandler(ESGPubHandlerBase):
             return var
 
 
+    def _get_longitude_range(self, longitudes,
+                             global_threshold=350.):
+        """
+        Given a scatter of longitude points, returns the west and east extremes.
+
+        This is done by sorting them and locating the biggest "gap" (arc of circle),
+        but subject to a threshold that if the range spanned is close to 360,
+        then treating it as global.
+        """
+        x = np.asarray(longitudes, dtype=float).ravel()
+        x = x[np.isfinite(x)]
+
+        if len(x) == 0:
+            raise ValueError("No finite longitude values")
+
+        # Identify the convention used by the input data.
+        if np.all((x >= 0) & (x <= 360)):
+            globe_start = 0.
+        else:
+            globe_start = -180.
+
+        x = np.sort(x)
+
+        # If necessary, normalise
+        if x[0] < 0 or x[-1] > 360 or x[-1] - x[0] >= 360:
+            x = x % 360
+            x = np.sort(x)
+
+        if len(x) == 1 or x[0] == x[-1]:
+            return x[0], x[0]
+
+        wrap_gap = (x[0] - x[-1]) % 360
+        gaps = np.append(np.diff(x) % 360, wrap_gap)
+
+        # largest empty arc
+        i = np.argmax(gaps)
+        largest_gap = gaps[i]
+        span = 360 - largest_gap
+
+        if span >= global_threshold:
+            # virtually global per heuristic, so return global range
+            #  (-180,180 or 0,360 as per the data)
+            return globe_start, globe_start + 360
+
+        start = x[(i + 1) % len(x)]
+        end = x[i]
+        lon_min = (start - globe_start) % 360 + globe_start
+        lon_max = (end - globe_start) % 360 + globe_start
+        if lon_max == globe_start:
+            lon_max += 360
+        return lon_min, lon_max
+
+
+    def _min_and_max(self, a, b):
+        if a < b:
+            return a, b
+        else:
+            return b, a
+
+
     def _get_min_max_bounds(self, scanobj, var):
 
         if var.name not in scanobj.coords:
@@ -80,67 +155,48 @@ class ESGPubXArrayHandler(ESGPubHandlerBase):
         # use the bounds variable instead if available, so that the range
         # that is returned will include the bounds and not just the central value
         bounds_var_name = var.attrs.get("bounds")
-        if bounds_var_name is not None:
-            bounds_var = scanobj[bounds_var_name]
-            using_bounds_var = True
+        if (bounds_var_name is not None
+            and bounds_var_name in scanobj.variables):
+            var = scanobj[bounds_var_name]
             self.publog.info(f"{stdname} has bounds var")
+            using_bounds = True
         else:
-            using_bounds_var = False
             self.publog.info(f"{stdname} no bounds var")
+            using_bounds = False
 
         # undo any broadcasting in time that xarray may have done
         # for non-time variable (seems to do this for vertices array
         # of original shape (ny, nx, 4) when opening multiple files)
         if stdname != "time":
             var = self._undo_time_broadcast(var)
-            if using_bounds_var:
-                bounds_var = self._undo_time_broadcast(bounds_var)
 
+        # Get the min, max range in the same way both for a 1d coordinate axis
+        # and also for an irregular grid.  With a 1d axis, in fact we only
+        # need to inspect a couple of elements, but the extra work here is not
+        # very expensive, and the code is simpler.
         shape = var.shape
-        if not using_bounds_var and len(shape) == 1:
 
-            # 1d coordinate variable
-            first = self._get_item(var[0])
-            last = self._get_item(var[-1])
-            minmax = (first, last)
-
-            # deal with a special case
-            # no bounds variable specified, but values on a regular
-            # longitude grid make it obvious that this is really global
-            if (stdname == "longitude"
-                and var.size > 1):
-
-                interval = self._get_item(var[1]) - first
-                after_last = last + interval
-                if abs(after_last - first - 360) < 1e-3:
-                    minmax = (first, after_last)
-
-        elif using_bounds_var and len(shape) == 2 and shape[1] == 2:
-            # bounds variable of expected shape for 1d coordinate variable
-            minmax = (self._get_item(bounds_var[0][0]),
-                      self._get_item(bounds_var[-1][1]))
+        if stdname == "longitude":
+            # For longitude, always use the same algorithm, regardless of whether it is
+            # 1d or 2d coord var.  (For 1d, we might need to unnecessarily inspect *all*
+            # the longitudes, but it won't be expensive, and it simplifies some other
+            # complexity.)
+            minmax = self._get_longitude_range(var.values)
 
         else:
-            # complex grid (>1d coordinate variable)
-            # use the extreme values found
-
-            # Where a bounds var is used, look in both the var and the bounds var.
-            # Normally the extreme values would be found in the bounds var, but in one
-            # example (CNRM-CM6-1-HR), for longitude, a gridbox *centre* was on the
-            # 180 meridian, hence why looking also in the main var.
-            if using_bounds_var:
-                minmax = (min(var.values.min(), bounds_var.values.min()),
-                          max(var.values.max(), bounds_var.values.max()))
+            # Otherwise, try not to compute all the values unless it is actually 2d.
+            # This is particularly important for the time axis.
+            if not using_bounds and len(shape) == 1:
+                # 1d coord variable
+                minmax = self._min_and_max(self._get_item(var[0]),
+                                           self._get_item(var[-1]))
+            elif using_bounds and len(shape) == 2 and shape[1] == 2:
+                # bounds variable of expected shape for 1d coordinate variable
+                minmax = self._min_and_max(self._get_item(var[0, 0]),
+                                           self._get_item(var[-1, 1]))
             else:
-                minmax = (var.values.min(), var.values.max())
-
-        # ensure that max >= min in most cases (even if e.g. data has lats
-        # from north to south), but NOT for longitude because it is valid to
-        # have min > max numerically due to wrapping, so don't disrupt this
-        # because swapping the ordering changes the meaning in non-global case
-
-        if stdname != "longitude" and minmax[1] < minmax[0]:
-            minmax = (minmax[1], minmax[0])
+                vals = var.values
+                minmax = (vals.min(), vals.max())
 
         return minmax
 
@@ -163,6 +219,7 @@ class ESGPubXArrayHandler(ESGPubHandlerBase):
                 ("time", ("datetime_start", "datetime_end"), self._get_time_str),
                 ("air_pressure", ("height_top", "height_bottom"), None),
         ]:
+
             var = self._get_coord_var_by_stdname(scanobj, stdname)
             if var is not None:
                 if len(var.shape) > 0 and var.size > 0:
@@ -174,7 +231,6 @@ class ESGPubXArrayHandler(ESGPubHandlerBase):
                         geo_units.append(var.units)
                 else:
                     self.publog.warn(f"{stdname} found but len 0")
-
 
         if len(geo_units) > 0:
             record["geo_units"] = geo_units
